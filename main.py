@@ -344,13 +344,25 @@ def poll_signals() -> None:
 
 def main() -> None:
     if not API_KEY:
-        logger.error("CHROMESIGNALS_API_KEY not set. Get your key at thechromesignals.com/app/autotrade")
-        sys.exit(1)
+        logger.error(
+            "CHROMESIGNALS_API_KEY not set.\n"
+            "  1. Get your key at thechromesignals.com/app/autotrade\n"
+            "  2. Add it as an env var in Railway: CHROMESIGNALS_API_KEY=cs_live_xxx\n"
+            "  3. Railway will auto-restart this service.\n\n"
+            "Waiting 5 minutes before checking again..."
+        )
+        time.sleep(300)
+        return
 
     if not WEBULL_APP_KEY or not WEBULL_APP_SECRET:
         if not DRY_RUN:
-            logger.error("WEBULL_APP_KEY and WEBULL_APP_SECRET required (or set DRY_RUN=true)")
-            sys.exit(1)
+            logger.error(
+                "WEBULL_APP_KEY and WEBULL_APP_SECRET not set.\n"
+                "  Add your Webull developer credentials as env vars, or set DRY_RUN=true to test.\n"
+                "  Waiting 5 minutes before checking again..."
+            )
+            time.sleep(300)
+            return
 
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     logger.info("ChromeSignals Bot starting (%s)", mode)
@@ -387,4 +399,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        main()
+        logger.info("Restarting in 10 seconds...")
+        time.sleep(10)
