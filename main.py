@@ -33,6 +33,7 @@ WEBULL_APP_SECRET = os.getenv("WEBULL_APP_SECRET", "")
 POLL_INTERVAL = 15
 
 SIGNAL_API = "https://www.thechromesignals.com/api/signals/latest"
+CONFIRM_API = "https://www.thechromesignals.com/api/signals/confirm"
 
 # Settings synced from dashboard every poll cycle
 risk_pct = 0.70
@@ -161,6 +162,40 @@ def place_sell(ticker: str, shares: float) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Execution confirmation
+# ---------------------------------------------------------------------------
+
+def confirm_execution(signal_type: str, ticker: str, fill_data: dict,
+                      pnl_pct: float | None = None, exit_reason: str | None = None) -> None:
+    """POST execution details back to ChromeSignals for tracking and notifications."""
+    try:
+        body = {
+            "type": signal_type,
+            "ticker": ticker,
+            "price": fill_data.get("fill_price", 0),
+            "shares": fill_data.get("shares", 0),
+            "order_id": fill_data.get("order_id", ""),
+        }
+        if pnl_pct is not None:
+            body["pnl_pct"] = round(pnl_pct, 2)
+        if exit_reason is not None:
+            body["exit_reason"] = exit_reason
+
+        resp = requests.post(
+            CONFIRM_API,
+            headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("Confirmed %s %s to ChromeSignals", signal_type, ticker)
+        else:
+            logger.warning("Confirmation returned %d for %s %s", resp.status_code, signal_type, ticker)
+    except Exception as e:
+        logger.warning("Confirmation failed for %s %s: %s (non-blocking)", signal_type, ticker, e)
+
+
+# ---------------------------------------------------------------------------
 # Signal processing
 # ---------------------------------------------------------------------------
 
@@ -203,6 +238,8 @@ def handle_entry(signal: dict) -> None:
         ticker, fill['shares'], fill['fill_price'], fill['hard_stop'], allocation
     )
 
+    confirm_execution("entry", ticker, fill)
+
 
 def handle_exit(signal: dict) -> None:
     global win_count
@@ -239,6 +276,8 @@ def handle_exit(signal: dict) -> None:
         ticker, icon, pos['shares'], exit_price, pnl_pct, pnl_usd,
         signal.get('exit_reason', '?'), trade_count, wr
     )
+
+    confirm_execution("exit", ticker, {"fill_price": exit_price, "shares": pos["shares"], "order_id": pos.get("order_id", "")}, pnl_pct=pnl_pct, exit_reason=signal.get("exit_reason", "unknown"))
 
 
 def poll_signals() -> None:
@@ -280,6 +319,33 @@ def poll_signals() -> None:
                 if new_max != max_positions:
                     logger.info("Max positions updated: %d -> %d", max_positions, new_max)
                     max_positions = new_max
+
+        # Check for kill switch
+        if data.get("kill"):
+            logger.warning("KILL SWITCH ACTIVATED — closing all positions and stopping")
+            for ticker in list(open_positions.keys()):
+                pos = open_positions[ticker]
+                fill = place_sell(ticker, pos["shares"])
+                if fill:
+                    exit_price = fill["fill_price"]
+                    pnl_pct = ((exit_price / pos["entry_price"]) - 1) * 100
+                    logger.info("KILL SELL — %s @ $%.2f (%+.1f%%)", ticker, exit_price, pnl_pct)
+                    confirm_execution("exit", ticker, fill, pnl_pct=pnl_pct, exit_reason="kill_switch")
+                    del open_positions[ticker]
+                else:
+                    logger.error("KILL SELL FAILED for %s — MANUAL INTERVENTION NEEDED", ticker)
+            # Stop polling until resumed
+            logger.warning("Bot stopped. Will check for resume every 60 seconds.")
+            while True:
+                time.sleep(60)
+                try:
+                    resp = requests.get(SIGNAL_API, headers={"X-API-Key": API_KEY}, params={"limit": "1"}, timeout=15)
+                    if resp.status_code == 200 and not resp.json().get("kill"):
+                        logger.info("RESUME signal received — restarting normal operation")
+                        break
+                except Exception:
+                    pass
+            return
 
         signals = data.get("signals", [])
 
