@@ -8,19 +8,9 @@ Required env vars:
     CHROMESIGNALS_API_KEY  — your API key from thechromesignals.com/app/autotrade
     WEBULL_APP_KEY         — your Webull developer app key
     WEBULL_APP_SECRET      — your Webull developer app secret
-
-Optional env vars:
-    RISK_PCT               — % of available cash per trade (default: 70)
-    MAX_POSITIONS          — max simultaneous positions (default: 5)
-    POLL_INTERVAL          — seconds between signal checks (default: 15)
-    TELEGRAM_BOT_TOKEN     — your personal Telegram bot for notifications
-    TELEGRAM_CHAT_ID       — your Telegram chat ID for notifications
-    DRY_RUN                — set to "true" to log signals without trading
 """
-import json
 import logging
 import os
-import sys
 import time
 from datetime import datetime, timezone
 
@@ -40,15 +30,13 @@ logger = logging.getLogger("chromesignals-bot")
 API_KEY = os.getenv("CHROMESIGNALS_API_KEY", "")
 WEBULL_APP_KEY = os.getenv("WEBULL_APP_KEY", "")
 WEBULL_APP_SECRET = os.getenv("WEBULL_APP_SECRET", "")
-RISK_PCT = float(os.getenv("RISK_PCT", "70")) / 100.0
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
-DRY_RUN = os.getenv("DRY_RUN", "").lower() == "true"
+POLL_INTERVAL = 15
 
 SIGNAL_API = "https://www.thechromesignals.com/api/signals/latest"
 
-TG_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Settings synced from dashboard every poll cycle
+risk_pct = 0.70
+max_positions = 5
 
 
 # ---------------------------------------------------------------------------
@@ -59,28 +47,6 @@ open_positions: dict[str, dict] = {}
 last_signal_ts = ""
 trade_count = 0
 win_count = 0
-
-
-# ---------------------------------------------------------------------------
-# Notifications
-# ---------------------------------------------------------------------------
-
-def notify(message: str) -> None:
-    logger.info(message)
-    if TG_BOT_TOKEN and TG_CHAT_ID:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TG_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=10,
-            )
-        except Exception:
-            logger.warning("Telegram notification failed")
 
 
 # ---------------------------------------------------------------------------
@@ -208,23 +174,19 @@ def handle_entry(signal: dict) -> None:
         logger.info("Already holding %s, skipping entry", ticker)
         return
 
-    if len(open_positions) >= MAX_POSITIONS:
-        logger.info("Max positions (%d) reached, skipping %s", MAX_POSITIONS, ticker)
-        return
-
-    if DRY_RUN:
-        notify(f"[DRY RUN] ENTRY signal: {ticker} @ ${signal.get('entry_price', '?')}")
+    if len(open_positions) >= max_positions:
+        logger.info("Max positions (%d) reached, skipping %s", max_positions, ticker)
         return
 
     balance = get_webull_balance()
-    allocation = balance * RISK_PCT
+    allocation = balance * risk_pct
     if allocation < 10:
-        notify(f"Insufficient funds for {ticker} (available: ${balance:.2f})")
+        logger.info("Insufficient funds for %s (available: $%.2f)", ticker, balance)
         return
 
     fill = place_buy(ticker, allocation)
     if not fill:
-        notify(f"BUY {ticker} FAILED")
+        logger.error("BUY %s FAILED", ticker)
         return
 
     open_positions[ticker] = {
@@ -236,11 +198,9 @@ def handle_entry(signal: dict) -> None:
     }
     trade_count += 1
 
-    notify(
-        f"BUY EXECUTED — {ticker}\n"
-        f"{fill['shares']:.4f} shares @ ${fill['fill_price']:.2f}\n"
-        f"Hard stop: ${fill['hard_stop']:.2f} (-2%)\n"
-        f"Allocation: ${allocation:.2f}"
+    logger.info(
+        "BUY EXECUTED — %s | %.4f shares @ $%.2f | Hard stop: $%.2f (-2%%) | Allocation: $%.2f",
+        ticker, fill['shares'], fill['fill_price'], fill['hard_stop'], allocation
     )
 
 
@@ -256,13 +216,9 @@ def handle_exit(signal: dict) -> None:
 
     pos = open_positions[ticker]
 
-    if DRY_RUN:
-        notify(f"[DRY RUN] EXIT signal: {ticker} — {signal.get('exit_reason', '?')}")
-        return
-
     fill = place_sell(ticker, pos["shares"])
     if not fill:
-        notify(f"SELL {ticker} FAILED — CHECK YOUR ACCOUNT")
+        logger.error("SELL %s FAILED — CHECK YOUR ACCOUNT", ticker)
         return
 
     exit_price = fill["fill_price"]
@@ -278,17 +234,15 @@ def handle_exit(signal: dict) -> None:
     icon = "WIN" if pnl_usd > 0 else "LOSS"
     wr = (win_count / trade_count * 100) if trade_count > 0 else 0
 
-    notify(
-        f"SELL EXECUTED — {ticker} ({icon})\n"
-        f"{pos['shares']:.4f} shares @ ${exit_price:.2f}\n"
-        f"P&L: {'+' if pnl_pct > 0 else ''}{pnl_pct:.1f}% (${pnl_usd:+.2f})\n"
-        f"Reason: {signal.get('exit_reason', '?')}\n"
-        f"Record: {trade_count} trades, {wr:.0f}% WR"
+    logger.info(
+        "SELL EXECUTED — %s (%s) | %.4f shares @ $%.2f | P&L: %+.1f%% ($%+.2f) | %s | %d trades, %.0f%% WR",
+        ticker, icon, pos['shares'], exit_price, pnl_pct, pnl_usd,
+        signal.get('exit_reason', '?'), trade_count, wr
     )
 
 
 def poll_signals() -> None:
-    global last_signal_ts
+    global last_signal_ts, risk_pct, max_positions
 
     try:
         params = {"limit": "10"}
@@ -310,6 +264,23 @@ def poll_signals() -> None:
             return
 
         data = resp.json()
+
+        # Apply settings synced from dashboard
+        settings = data.get("settings")
+        if settings:
+            new_risk = settings.get("risk_pct")
+            new_max = settings.get("max_positions")
+            if new_risk is not None:
+                new_risk_dec = float(new_risk) / 100.0
+                if abs(new_risk_dec - risk_pct) > 0.001:
+                    logger.info("Risk updated: %.0f%% -> %.0f%%", risk_pct * 100, new_risk_dec * 100)
+                    risk_pct = new_risk_dec
+            if new_max is not None:
+                new_max = int(new_max)
+                if new_max != max_positions:
+                    logger.info("Max positions updated: %d -> %d", max_positions, new_max)
+                    max_positions = new_max
+
         signals = data.get("signals", [])
 
         if not signals:
@@ -355,18 +326,16 @@ def main() -> None:
         return
 
     if not WEBULL_APP_KEY or not WEBULL_APP_SECRET:
-        if not DRY_RUN:
-            logger.error(
-                "WEBULL_APP_KEY and WEBULL_APP_SECRET not set.\n"
-                "  Add your Webull developer credentials as env vars, or set DRY_RUN=true to test.\n"
-                "  Waiting 5 minutes before checking again..."
-            )
-            time.sleep(300)
-            return
+        logger.error(
+            "WEBULL_APP_KEY and WEBULL_APP_SECRET not set.\n"
+            "  Add your Webull developer credentials as env vars in Railway.\n"
+            "  Waiting 5 minutes before checking again..."
+        )
+        time.sleep(300)
+        return
 
-    mode = "DRY RUN" if DRY_RUN else "LIVE"
-    logger.info("ChromeSignals Bot starting (%s)", mode)
-    logger.info("Risk: %.0f%% | Max positions: %d | Poll: %ds", RISK_PCT * 100, MAX_POSITIONS, POLL_INTERVAL)
+    logger.info("ChromeSignals Bot starting (LIVE)")
+    logger.info("Risk: %.0f%% | Max positions: %d | Poll: %ds (syncs from dashboard)", risk_pct * 100, max_positions, POLL_INTERVAL)
 
     # Initial connection test
     try:
@@ -378,7 +347,6 @@ def main() -> None:
         )
         if resp.status_code == 200:
             logger.info("Signal API connected")
-            notify(f"ChromeSignals Bot started ({mode})\nRisk: {RISK_PCT*100:.0f}% | Max: {MAX_POSITIONS} positions")
         elif resp.status_code == 401:
             logger.error(
                 "API key rejected. Check CHROMESIGNALS_API_KEY.\n"
