@@ -380,8 +380,13 @@ def main() -> None:
             logger.info("Signal API connected")
             notify(f"ChromeSignals Bot started ({mode})\nRisk: {RISK_PCT*100:.0f}% | Max: {MAX_POSITIONS} positions")
         elif resp.status_code == 401:
-            logger.error("API key rejected. Check CHROMESIGNALS_API_KEY.")
-            sys.exit(1)
+            logger.error(
+                "API key rejected. Check CHROMESIGNALS_API_KEY.\n"
+                "  Get your key at thechromesignals.com/app/autotrade\n"
+                "  Waiting 5 minutes before retrying..."
+            )
+            time.sleep(300)
+            return
         else:
             logger.warning("Signal API returned %d on startup", resp.status_code)
     except Exception as e:
